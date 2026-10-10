@@ -58,7 +58,9 @@ async function findGeminiModel(apiKey) {
     console.error('No generateContent Gemini model found:', usable.map((model) => model.name));
     return { error: 'Bu API anahtarı için kullanılabilir Gemini generateContent modeli bulunamadı.' };
   }
-  return { model: preferred.name.replace(/^models\//, '') };
+  // Google model listesi tam kaynak adını döndürür: models/gemini-... .
+  // Bu adı aynen saklayıp endpoint oluştururken ikinci kez models/ eklemiyoruz.
+  return { modelResource: preferred.name, model: preferred.name.replace(/^models\//, '') };
 }
 
 async function analyzePdfWithGemini(pdfBytes) {
@@ -66,8 +68,10 @@ async function analyzePdfWithGemini(pdfBytes) {
   if (!apiKey) return { error: 'GEMINI_API_KEY sunucuda tanımlı değil.' };
   const selected = await findGeminiModel(apiKey);
   if (selected.error) return selected;
-  console.log('Gemini model selected:', selected.model);
-  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(selected.model)}:generateContent?key=${encodeURIComponent(apiKey)}`, {
+  console.log('Gemini model selected:', selected.modelResource);
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/${selected.modelResource}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  console.log('Gemini endpoint resource:', selected.modelResource);
+  const response = await fetch(endpoint, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ contents: [{ role: 'user', parts: [
       { inlineData: { mimeType: 'application/pdf', data: Buffer.from(pdfBytes).toString('base64') } },
@@ -75,14 +79,17 @@ async function analyzePdfWithGemini(pdfBytes) {
     ] }], generationConfig: { responseMimeType: 'application/json', temperature: 0.1 } })
   });
   if (!response.ok) {
-    const body = await response.text();
-    console.error('Gemini PDF analysis failed:', response.status, body.slice(0, 1500));
-    return { error: `Gemini analizi başarısız oldu (${response.status}).` };
+    const responseBody = await response.text();
+    console.error('Gemini PDF analysis failed:', response.status, responseBody.slice(0, 3000));
+    return { error: `Gemini analizi başarısız oldu (${response.status}): ${responseBody.slice(0, 500)}` };
   }
   const data = await response.json();
   const text = data?.candidates?.[0]?.content?.parts?.map((part) => part.text || '').join('\n') || '';
   const parsed = parseJson(text);
-  if (!parsed) return { error: 'Gemini yanıtı JSON olarak okunamadı.' };
+  if (!parsed) {
+    console.error('Gemini JSON parse failed:', text.slice(0, 2000));
+    return { error: 'Gemini yanıtı JSON olarak okunamadı.' };
+  }
   const questions = (Array.isArray(parsed.questions) ? parsed.questions : []).map((question) => {
     const validation = validateQuestionCandidate(question);
     return { ...question, validation, quality: createQualityRecord(question, validation) };
