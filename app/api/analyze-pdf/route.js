@@ -41,26 +41,38 @@ function parseJson(text) {
   try { return JSON.parse(cleaned); } catch { return null; }
 }
 
-const ANALYSIS_PROMPT = `Bu PDF bir sınav/deneme kaynağı olabilir veya ilgisiz bir belge olabilir. Belgenin içeriğini gerçekten incele. Sadece A, B, C, D, E harfleri veya numaralı maddeler bulunduğu için soru kabul etme.
+const ANALYSIS_PROMPT = `Bu PDF bir sınav/deneme kaynağı olabilir veya ilgisiz bir belge olabilir. Belgenin içeriğini gerçekten incele. Sadece A, B, C, D, E harfleri veya numaralı maddeler bulunduğu için soru kabul etme. Her gerçek çoktan seçmeli soruyu ayrı ayrı tespit et. Soru kökü ile seçeneklerin aynı soruya ait olduğunu doğrula. Başlıkları, içindekileri, rapor maddelerini, açıklama listelerini ve cevap anahtarı satırlarını soru sayma. Eksik veya şüpheli adayları uydurma. Türkçe metni mümkün olduğunca aynen koru. Ders ve konu için emin değilsen null kullan. Doğru cevabı tahmin etme. Yalnızca geçerli JSON döndür: {"documentIsExam":true,"documentConfidence":0,"questions":[{"number":1,"stem":"...","options":[{"label":"A","text":"..."}],"subject":null,"topic":null,"questionConfidence":0}],"notes":[]}`;
 
-Her gerçek çoktan seçmeli soruyu ayrı ayrı tespit et. Soru kökü ile seçeneklerin aynı soruya ait olduğunu doğrula. Başlıkları, içindekileri, rapor maddelerini, açıklama listelerini ve cevap anahtarı satırlarını soru sayma. Eksik veya şüpheli adayları uydurma. Türkçe metni mümkün olduğunca aynen koru. Ders ve konu için emin değilsen null kullan. Doğru cevabı tahmin etme.
-
-Yalnızca geçerli JSON döndür ve şu yapıyı kullan:
-{"documentIsExam":true,"documentConfidence":0,"questions":[{"number":1,"stem":"...","options":[{"label":"A","text":"..."},{"label":"B","text":"..."}],"subject":null,"topic":null,"questionConfidence":0}],"notes":[]}`;
+async function findGeminiModel(apiKey) {
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}`);
+  if (!response.ok) {
+    const body = await response.text();
+    console.error('Gemini model list failed:', response.status, body.slice(0, 1500));
+    return { error: `Gemini model listesi alınamadı (${response.status}).` };
+  }
+  const data = await response.json();
+  const usable = (data.models || []).filter((model) => Array.isArray(model.supportedGenerationMethods) && model.supportedGenerationMethods.includes('generateContent'));
+  const preferred = usable.find((model) => /flash/i.test(model.name) && !/image|tts|live/i.test(model.name))
+    || usable.find((model) => /gemini/i.test(model.name) && !/image|tts|live/i.test(model.name));
+  if (!preferred?.name) {
+    console.error('No generateContent Gemini model found:', usable.map((model) => model.name));
+    return { error: 'Bu API anahtarı için kullanılabilir Gemini generateContent modeli bulunamadı.' };
+  }
+  return { model: preferred.name.replace(/^models\//, '') };
+}
 
 async function analyzePdfWithGemini(pdfBytes) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) return { error: 'GEMINI_API_KEY sunucuda tanımlı değil.' };
-  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(apiKey)}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{ role: 'user', parts: [
-        { inlineData: { mimeType: 'application/pdf', data: Buffer.from(pdfBytes).toString('base64') } },
-        { text: ANALYSIS_PROMPT }
-      ] }],
-      generationConfig: { responseMimeType: 'application/json', temperature: 0.1 }
-    })
+  const selected = await findGeminiModel(apiKey);
+  if (selected.error) return selected;
+  console.log('Gemini model selected:', selected.model);
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(selected.model)}:generateContent?key=${encodeURIComponent(apiKey)}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ contents: [{ role: 'user', parts: [
+      { inlineData: { mimeType: 'application/pdf', data: Buffer.from(pdfBytes).toString('base64') } },
+      { text: ANALYSIS_PROMPT }
+    ] }], generationConfig: { responseMimeType: 'application/json', temperature: 0.1 } })
   });
   if (!response.ok) {
     const body = await response.text();
@@ -76,7 +88,7 @@ async function analyzePdfWithGemini(pdfBytes) {
     return { ...question, validation, quality: createQualityRecord(question, validation) };
   });
   const verifiedQuestions = questions.filter((q) => q.validation.isQuestion && Number(q.questionConfidence || 0) >= 70);
-  return { provider: 'gemini', documentIsExam: Boolean(parsed.documentIsExam), documentConfidence: Number(parsed.documentConfidence || 0), questions, verifiedQuestions, notes: Array.isArray(parsed.notes) ? parsed.notes : [] };
+  return { provider: 'gemini', model: selected.model, documentIsExam: Boolean(parsed.documentIsExam), documentConfidence: Number(parsed.documentConfidence || 0), questions, verifiedQuestions, notes: Array.isArray(parsed.notes) ? parsed.notes : [] };
 }
 
 export async function POST(request) {
@@ -88,7 +100,6 @@ export async function POST(request) {
     const path = String(body?.path || '');
     const fileName = String(body?.fileName || path.split('/').pop() || 'dosya.pdf');
     if (!path) return NextResponse.json({ error: 'Analiz edilecek PDF yolu eksik.' }, { status: 400 });
-
     const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
     const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
     if (!supabaseUrl || !supabaseKey) return NextResponse.json({ error: 'Sunucu depolama ayarları eksik.' }, { status: 500 });
@@ -96,7 +107,6 @@ export async function POST(request) {
     const { data: userData, error: userError } = await supabase.auth.getUser(token);
     if (userError || !userData?.user) return NextResponse.json({ error: 'Oturum doğrulanamadı.' }, { status: 401 });
     if (!path.startsWith(`${userData.user.id}/`)) return NextResponse.json({ error: 'Bu PDF için erişim iznin yok.' }, { status: 403 });
-
     const { data: pdfBlob, error: downloadError } = await supabase.storage.from('pdfs').download(path);
     if (downloadError || !pdfBlob) return NextResponse.json({ error: 'PDF bulut alanından indirilemedi.' }, { status: 500 });
     const pdfBytes = Buffer.from(await pdfBlob.arrayBuffer());
@@ -107,20 +117,15 @@ export async function POST(request) {
       const ai = await analyzePdfWithGemini(pdfBytes);
       if (!ai.error) {
         const count = ai.verifiedQuestions.length;
-        return NextResponse.json({
-          fileName, pages: parsed.pages, pagesWithText: parsed.pagesWithText, textLength: parsed.text.length,
-          needsOcr: parsed.needsOcr, analysisMode: 'gemini-pdf', aiUsed: true, aiProvider: 'gemini',
-          suitable: ai.documentIsExam && count > 0, confidence: ai.documentConfidence,
-          questionCount: count, candidateCount: ai.questions.length,
-          choiceCount: ai.verifiedQuestions.reduce((sum, q) => sum + (q.options?.length || 0), 0),
-          answerKeyDetected: false, questions: ai.verifiedQuestions,
-          rejectedQuestions: ai.questions.filter((q) => !ai.verifiedQuestions.includes(q)),
-          reasons: count ? ai.notes : ['Gemini belgeyi inceledi ancak yeterli güvenle gerçek sınav sorusu doğrulayamadı.', ...ai.notes]
-        });
+        return NextResponse.json({ fileName, pages: parsed.pages, pagesWithText: parsed.pagesWithText, textLength: parsed.text.length, needsOcr: parsed.needsOcr,
+          analysisMode: 'gemini-pdf', aiUsed: true, aiProvider: 'gemini', aiModel: ai.model,
+          suitable: ai.documentIsExam && count > 0, confidence: ai.documentConfidence, questionCount: count, candidateCount: ai.questions.length,
+          choiceCount: ai.verifiedQuestions.reduce((sum, q) => sum + (q.options?.length || 0), 0), answerKeyDetected: false,
+          questions: ai.verifiedQuestions, rejectedQuestions: ai.questions.filter((q) => !ai.verifiedQuestions.includes(q)),
+          reasons: count ? ai.notes : ['Gemini belgeyi inceledi ancak yeterli güvenle gerçek sınav sorusu doğrulayamadı.', ...ai.notes] });
       }
       console.error('Gemini fallback unavailable:', ai.error);
     }
-
     return NextResponse.json({ fileName, pages: parsed.pages, pagesWithText: parsed.pagesWithText, textLength: parsed.text.length, needsOcr: parsed.needsOcr, analysisMode: 'pdf-text', ...textResult });
   } catch (error) {
     console.error('PDF analysis failed:', error);
