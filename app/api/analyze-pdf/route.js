@@ -52,14 +52,15 @@ async function findGeminiModel(apiKey) {
   }
   const data = await response.json();
   const usable = (data.models || []).filter((model) => Array.isArray(model.supportedGenerationMethods) && model.supportedGenerationMethods.includes('generateContent'));
-  const preferred = usable.find((model) => /flash/i.test(model.name) && !/image|tts|live/i.test(model.name))
-    || usable.find((model) => /gemini/i.test(model.name) && !/image|tts|live/i.test(model.name));
+  console.log('Gemini generateContent models:', usable.map((model) => model.name).join(', '));
+  const preferred = usable.find((model) => /gemini-3\.8-flash/i.test(model.name))
+    || usable.find((model) => /gemini-3/i.test(model.name) && /flash/i.test(model.name) && !/image|tts|live/i.test(model.name))
+    || usable.find((model) => /flash/i.test(model.name) && !/2\.5-flash/i.test(model.name) && !/image|tts|live/i.test(model.name))
+    || usable.find((model) => /gemini/i.test(model.name) && !/2\.5-flash/i.test(model.name) && !/image|tts|live/i.test(model.name));
   if (!preferred?.name) {
-    console.error('No generateContent Gemini model found:', usable.map((model) => model.name));
-    return { error: 'Bu API anahtarı için kullanılabilir Gemini generateContent modeli bulunamadı.' };
+    console.error('No current generateContent Gemini model found:', usable.map((model) => model.name));
+    return { error: 'Bu API anahtarı için güncel Gemini generateContent modeli bulunamadı.' };
   }
-  // Google model listesi tam kaynak adını döndürür: models/gemini-... .
-  // Bu adı aynen saklayıp endpoint oluştururken ikinci kez models/ eklemiyoruz.
   return { modelResource: preferred.name, model: preferred.name.replace(/^models\//, '') };
 }
 
@@ -70,7 +71,6 @@ async function analyzePdfWithGemini(pdfBytes) {
   if (selected.error) return selected;
   console.log('Gemini model selected:', selected.modelResource);
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/${selected.modelResource}:generateContent?key=${encodeURIComponent(apiKey)}`;
-  console.log('Gemini endpoint resource:', selected.modelResource);
   const response = await fetch(endpoint, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ contents: [{ role: 'user', parts: [
