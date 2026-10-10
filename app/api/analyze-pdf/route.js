@@ -21,10 +21,13 @@ function pageItemsToText(items = []) {
     .map((line) => line.parts.sort((a, b) => a.x - b.x).map((part) => part.str).join(' ')).join('\n');
 }
 
-async function extractPdfText(arrayBuffer) {
+async function extractPdfText(pdfBytes) {
   const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
   pdfjs.GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/legacy/build/pdf.worker.mjs', import.meta.url).toString();
-  const document = await pdfjs.getDocument({ data: new Uint8Array(arrayBuffer), useWorkerFetch: false, isEvalSupported: false }).promise;
+  // pdf.js aktarilan typed array'in ArrayBuffer'ini detach edebilir. Bu nedenle
+  // yalnızca metin çıkarımı için bağımsız bir kopya veriyoruz.
+  const pdfjsBytes = Uint8Array.from(pdfBytes);
+  const document = await pdfjs.getDocument({ data: pdfjsBytes, useWorkerFetch: false, isEvalSupported: false }).promise;
   const pages = [];
   let pagesWithText = 0;
   for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
@@ -53,23 +56,15 @@ function parseJson(text) {
 async function analyzePdfWithAI(pdfBytes, fileName) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return { error: 'OPENAI_API_KEY sunucuda tanımlı değil.' };
-
   const base64 = Buffer.from(pdfBytes).toString('base64');
   const prompt = `Bu PDF bir sınav/deneme kaynağı olabilir veya ilgisiz bir belge olabilir. Belgeyi gerçekten incele. Sadece A-B-C-D-E harfleri gördüğün için soru kabul etme. Her gerçek çoktan seçmeli soruyu ayrı ayrı belirle. Soru kökü ile ona ait seçeneklerin aynı soruya ait olduğundan emin ol. Başlık, içindekiler, rapor maddeleri, cevap anahtarı satırları ve rastgele numaralı listeleri soru sayma. Emin olmadığın adayı soru olarak uydurma. Türkçe metni aynen korumaya çalış. Yalnızca JSON döndür: {"documentIsExam":boolean,"documentConfidence":0-100,"questions":[{"number":number|null,"stem":string,"options":[{"label":"A","text":string}],"subject":string|null,"topic":string|null,"questionConfidence":0-100}],"notes":[string]}. Doğru cevabı tahmin etme.`;
-
   const response = await fetch('https://api.openai.com/v1/responses', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: 'gpt-5-mini',
-      input: [{ role: 'user', content: [
-        { type: 'input_file', filename: fileName, file_data: `data:application/pdf;base64,${base64}` },
-        { type: 'input_text', text: prompt }
-      ] }],
-      text: { format: { type: 'json_object' } }
-    })
+    method: 'POST', headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: 'gpt-5-mini', input: [{ role: 'user', content: [
+      { type: 'input_file', filename: fileName, file_data: `data:application/pdf;base64,${base64}` },
+      { type: 'input_text', text: prompt }
+    ] }], text: { format: { type: 'json_object' } } })
   });
-
   if (!response.ok) {
     const body = await response.text();
     console.error('OpenAI PDF analysis failed:', response.status, body.slice(0, 1000));
@@ -78,20 +73,12 @@ async function analyzePdfWithAI(pdfBytes, fileName) {
   const data = await response.json();
   const parsed = parseJson(extractResponseText(data));
   if (!parsed) return { error: 'AI yanıtı yapılandırılmış olarak okunamadı.' };
-
   const questions = (Array.isArray(parsed.questions) ? parsed.questions : []).map((question) => {
     const validation = validateQuestionCandidate(question);
     return { ...question, validation, quality: createQualityRecord(question, validation) };
   });
   const verifiedQuestions = questions.filter((q) => q.validation.isQuestion && Number(q.questionConfidence || 0) >= 70);
-  return {
-    aiUsed: true,
-    documentIsExam: Boolean(parsed.documentIsExam),
-    documentConfidence: Number(parsed.documentConfidence || 0),
-    questions,
-    verifiedQuestions,
-    notes: Array.isArray(parsed.notes) ? parsed.notes : []
-  };
+  return { aiUsed: true, documentIsExam: Boolean(parsed.documentIsExam), documentConfidence: Number(parsed.documentConfidence || 0), questions, verifiedQuestions, notes: Array.isArray(parsed.notes) ? parsed.notes : [] };
 }
 
 export async function POST(request) {
@@ -103,7 +90,6 @@ export async function POST(request) {
     const path = String(body?.path || '');
     const fileName = String(body?.fileName || path.split('/').pop() || 'dosya.pdf');
     if (!path) return NextResponse.json({ error: 'Analiz edilecek PDF yolu eksik.' }, { status: 400 });
-
     const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
     const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
     if (!supabaseUrl || !supabaseKey) return NextResponse.json({ error: 'Sunucu depolama ayarları eksik.' }, { status: 500 });
@@ -111,14 +97,15 @@ export async function POST(request) {
     const { data: userData, error: userError } = await supabase.auth.getUser(token);
     if (userError || !userData?.user) return NextResponse.json({ error: 'Oturum doğrulanamadı.' }, { status: 401 });
     if (!path.startsWith(`${userData.user.id}/`)) return NextResponse.json({ error: 'Bu PDF için erişim iznin yok.' }, { status: 403 });
-
     const { data: pdfBlob, error: downloadError } = await supabase.storage.from('pdfs').download(path);
     if (downloadError || !pdfBlob) return NextResponse.json({ error: 'PDF bulut alanından indirilemedi.' }, { status: 500 });
-    const pdfBytes = await pdfBlob.arrayBuffer();
+
+    // Ana PDF baytlarını Buffer olarak sakla. pdf.js yalnızca kendi kopyasını kullanır;
+    // böylece AI fallback aynı PDF'yi daha sonra güvenle okuyabilir.
+    const pdfBytes = Buffer.from(await pdfBlob.arrayBuffer());
     const parsed = await extractPdfText(pdfBytes);
     const textResult = analyzeExamText(parsed.text);
 
-    // Metin motoru güvenilir soru bulamazsa belgeyi doğrudan multimodal AI ile incele.
     if (textResult.questionCount < 3 || textResult.confidence < 60) {
       const ai = await analyzePdfWithAI(pdfBytes, fileName);
       if (!ai.error) {
@@ -126,20 +113,16 @@ export async function POST(request) {
         return NextResponse.json({
           fileName, pages: parsed.pages, pagesWithText: parsed.pagesWithText, textLength: parsed.text.length,
           needsOcr: parsed.needsOcr, analysisMode: 'ai-pdf', aiUsed: true,
-          suitable: ai.documentIsExam && count > 0,
-          confidence: ai.documentConfidence,
-          questionCount: count,
-          candidateCount: ai.questions.length,
+          suitable: ai.documentIsExam && count > 0, confidence: ai.documentConfidence,
+          questionCount: count, candidateCount: ai.questions.length,
           choiceCount: ai.verifiedQuestions.reduce((sum, q) => sum + (q.options?.length || 0), 0),
-          answerKeyDetected: false,
-          questions: ai.verifiedQuestions,
+          answerKeyDetected: false, questions: ai.verifiedQuestions,
           rejectedQuestions: ai.questions.filter((q) => !ai.verifiedQuestions.includes(q)),
           reasons: count ? ai.notes : ['AI belgeyi inceledi ancak yeterli güvenle gerçek sınav sorusu doğrulayamadı.', ...ai.notes]
         });
       }
       console.error('AI fallback unavailable:', ai.error);
     }
-
     return NextResponse.json({ fileName, pages: parsed.pages, pagesWithText: parsed.pagesWithText, textLength: parsed.text.length, needsOcr: parsed.needsOcr, analysisMode: 'pdf-text', ...textResult });
   } catch (error) {
     console.error('PDF analysis failed:', error);
