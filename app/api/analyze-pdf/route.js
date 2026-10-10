@@ -5,8 +5,19 @@ export const runtime = 'nodejs';
 
 async function extractPdfText(arrayBuffer) {
   const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
+
+  // Vercel serverless ortamında pdf.js'in worker dosyasını kendi kendine
+  // çözmeye çalışması "Setting up fake worker failed" hatasına yol açabiliyor.
+  // Worker dosyasını paket içinden açıkça gösteriyoruz.
+  pdfjs.GlobalWorkerOptions.workerSrc = new URL(
+    'pdfjs-dist/legacy/build/pdf.worker.mjs',
+    import.meta.url
+  ).toString();
+
   const document = await pdfjs.getDocument({
     data: new Uint8Array(arrayBuffer),
+    useWorkerFetch: false,
+    isEvalSupported: false,
   }).promise;
 
   const pages = [];
